@@ -10,7 +10,7 @@ use std::path::Path;
 use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{ArgMatches, CommandFactory, FromArgMatches, ValueEnum};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use colored::Colorize;
 use figment::Figment;
 use figment::providers::{Data, Format as _, Json, Toml, Yaml};
@@ -72,6 +72,13 @@ struct Cli {
         default_missing_value = "./report.zip"
     )]
     report: Option<PathBuf>,
+
+    /// Path of a configuration file outside the default path.
+    ///
+    /// When this is set, the default path is still considered, but the given file is considered
+    /// with the highest priority.
+    #[arg(long, env = "PROBE_RS_CONFIG_FILE")]
+    config_file: Option<String>,
 
     /// Remote host to connect to
     #[cfg(feature = "remote")]
@@ -544,7 +551,10 @@ async fn main() -> Result<()> {
 
     let args: Vec<_> = std::env::args_os().collect();
 
-    let config = load_config().context("Failed to load configuration.")?;
+    // this is an extra parsing, but required to provide a config file before command line arguments are fully matched
+    let args_checked = Cli::parse_from(args.clone());
+
+    let config = load_config(args_checked.config_file).context("Failed to load configuration.")?;
 
     // Special-case `cargo-embed` and `cargo-flash`.
     if let Some(args) = multicall_check(&args, "cargo-flash") {
@@ -755,10 +765,26 @@ fn compile_report(
     Ok(())
 }
 
-fn load_config() -> anyhow::Result<Config> {
+fn load_config(config_file: Option<String>) -> anyhow::Result<Config> {
     // Paths to search for the configuration file.
+    let mut paths: Vec<PathBuf> = vec![];
+    // user-inputted file (highest priority)
+    if let Some(config_file) = config_file
+        && let Some(cfg_path) = PathBuf::from(config_file).parent()
+    {
+        // using exists rather than try-exists as if exists returns false Figment probably won't be able to read it anyway
+        if cfg_path.exists() {
+            paths.push(cfg_path.into());
+        } else {
+            eprintln!(
+                "{} {}",
+                "Could not access config file folder, it will be ignored:".yellow(),
+                cfg_path.to_string_lossy()
+            );
+        }
+    };
     // cwd
-    let mut paths = vec![PathBuf::from(".")];
+    paths.push(PathBuf::from("."));
     // path to executable
     if let Ok(exe) = std::env::current_exe() {
         paths.push(exe.parent().unwrap().to_path_buf());
