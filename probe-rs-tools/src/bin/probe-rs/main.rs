@@ -10,7 +10,7 @@ use std::path::Path;
 use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, ValueEnum};
 use colored::Colorize;
 use figment::Figment;
 use figment::providers::{Data, Format as _, Json, Toml, Yaml};
@@ -73,11 +73,11 @@ struct Cli {
     )]
     report: Option<PathBuf>,
 
-    /// Path of a configuration file outside the default path.
+    /// Path of a configuration file outside the default search paths.
     ///
-    /// When this is set, the default path is still considered, but the given file is considered
-    /// with the highest priority.
-    #[arg(long, env = "PROBE_RS_CONFIG_FILE")]
+    /// When this is set, the default search paths are still considered, but the given file
+    /// has the highest priority.
+    #[arg(long, global = true, env = "PROBE_RS_CONFIG_FILE")]
     config_file: Option<String>,
 
     /// Remote host to connect to
@@ -551,10 +551,15 @@ async fn main() -> Result<()> {
 
     let args: Vec<_> = std::env::args_os().collect();
 
-    // this is an extra parsing, but required to provide a config file before command line arguments are fully matched
-    let args_checked = Cli::parse_from(args.clone());
+    // Lenient parse to extract --config-file (and its env var) before the
+    // multicall dispatch.
+    let config_file = Cli::command()
+        .ignore_errors(true)
+        .try_get_matches_from(&args)
+        .ok()
+        .and_then(|m| m.get_one::<String>("config_file").cloned());
 
-    let config = load_config(args_checked.config_file).context("Failed to load configuration.")?;
+    let config = load_config(config_file).context("Failed to load configuration.")?;
 
     // Special-case `cargo-embed` and `cargo-flash`.
     if let Some(args) = multicall_check(&args, "cargo-flash") {
@@ -766,26 +771,9 @@ fn compile_report(
 }
 
 fn load_config(config_file: Option<String>) -> anyhow::Result<Config> {
-    // Paths to search for the configuration file.
-    let mut paths: Vec<PathBuf> = vec![];
-    // user-inputted file (highest priority)
-    if let Some(config_file) = config_file
-        && let Some(cfg_path) = PathBuf::from(config_file).parent()
-    {
-        // using exists rather than try-exists as if exists returns false Figment probably won't be able to read it anyway
-        if cfg_path.exists() {
-            paths.push(cfg_path.into());
-        } else {
-            eprintln!(
-                "{} {}",
-                "Could not access config file folder, it will be ignored:".yellow(),
-                cfg_path.to_string_lossy()
-            );
-        }
-    };
-    // cwd
-    paths.push(PathBuf::from("."));
-    // path to executable
+    // Default search paths, in ascending priority (figment's `merge` lets later
+    // providers override earlier ones).
+    let mut paths = vec![PathBuf::from(".")];
     if let Ok(exe) = std::env::current_exe() {
         paths.push(exe.parent().unwrap().to_path_buf());
     }
@@ -806,6 +794,32 @@ fn load_config(config_file: Option<String>) -> anyhow::Result<Config> {
                 .merge(Json::file(path.join(format!("{file}.json"))))
                 .merge(Yaml::file(path.join(format!("{file}.yaml"))))
                 .merge(Yaml::file(path.join(format!("{file}.yml"))));
+        }
+    }
+
+    // User-supplied config file is merged last as it is highest priority
+    if let Some(config_file) = config_file {
+        let path = PathBuf::from(&config_file);
+        if !path.exists() {
+            eprintln!(
+                "{} {}",
+                "Configuration file does not exist, it will be ignored:".yellow(),
+                path.to_string_lossy()
+            );
+        } else {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase);
+            figment = match ext.as_deref() {
+                Some("toml") => figment.merge(Toml::file(&path)),
+                Some("json") => figment.merge(Json::file(&path)),
+                Some("yaml" | "yml") => figment.merge(Yaml::file(&path)),
+                _ => anyhow::bail!(
+                    "Unsupported config file extension for {}. Expected toml, json, yaml, or yml.",
+                    path.to_string_lossy()
+                ),
+            };
         }
     }
 
